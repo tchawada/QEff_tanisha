@@ -47,6 +47,16 @@ from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3RMSNorm,
     Gemma3TextModel,
 )
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4ForCausalLM,
+    Gemma4ForConditionalGeneration,
+    Gemma4RMSNorm,
+    Gemma4TextAttention,
+    Gemma4TextDecoderLayer,
+    Gemma4TextExperts,
+    Gemma4TextModel,
+    Gemma4TextRouter,
+)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Block, GPT2LMHeadModel, GPT2Model
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
     GPTBigCodeAttention,
@@ -298,6 +308,16 @@ from QEfficient.transformers.models.gemma3.modeling_gemma3 import (
     QEffGemma3DecoderWrapper,
     QEffGemma3ForConditionalGeneration,
     QEffGemma3TextModel,
+)
+from QEfficient.transformers.models.gemma4.modeling_gemma4 import (
+    QEffGemma4CustomRMSNormAIC,
+    QEffGemma4ForCausalLM,
+    QEffGemma4ForConditionalGeneration,
+    QEffGemma4TextAttention,
+    QEffGemma4TextDecoderLayer,
+    QEffGemma4TextExperts,
+    QEffGemma4TextModel,
+    QEffGemma4TextRouter,
 )
 from QEfficient.transformers.models.gpt2.modeling_gpt2 import (
     QEffGPT2Attention,
@@ -554,6 +574,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         GraniteMoeRMSNorm: CustomRMSNormAIC,
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
+        Gemma4RMSNorm: QEffGemma4CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
@@ -650,6 +671,14 @@ class KVCacheTransform(ModuleMappingTransform):
         Gemma3DecoderLayer: QEffGemma3DecoderLayer,
         Gemma3TextModel: QEffGemma3TextModel,
         Gemma3ForConditionalGeneration: QEffGemma3ForConditionalGeneration,
+        # Gemma4
+        Gemma4TextAttention: QEffGemma4TextAttention,
+        Gemma4TextDecoderLayer: QEffGemma4TextDecoderLayer,
+        Gemma4TextModel: QEffGemma4TextModel,
+        Gemma4ForCausalLM: QEffGemma4ForCausalLM,
+        Gemma4ForConditionalGeneration: QEffGemma4ForConditionalGeneration,
+        Gemma4TextExperts: QEffGemma4TextExperts,
+        Gemma4TextRouter: QEffGemma4TextRouter,
         # GPT_OSS
         GptOssAttention: QEffGptOssAttention,
         GptOssDecoderLayer: QEffGptOssDecoderLayer,
