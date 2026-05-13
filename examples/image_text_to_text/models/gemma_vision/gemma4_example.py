@@ -7,11 +7,11 @@ from gemma4_utils import (
     remove_fp16clip_transform_if_disabled,
     resolve_npi_mode,
 )
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoConfig
 
 from QEfficient import QEFFAutoModelForImageTextToText
 
-MODEL_ID = "google/gemma-4-E2B-it"
+MODEL_ID = "google/gemma-4-26B-A4B-it"
 SYSTEM_PROMPT = "You are a helpful assistant."
 TEXT_PROMPT = "Tell me about Taj Mahal?"
 IMAGE_PROMPT = "Can you Describe this image in detail?"
@@ -22,7 +22,7 @@ ENABLE_NPI = True
 DISABLE_NPI = False
 ENABLE_FP16_CLIP = True
 
-PREFILL_SEQ_LEN = 128
+PREFILL_SEQ_LEN = 288
 CTX_LEN = 2048
 GENERATION_LEN = 1920
 
@@ -37,6 +37,7 @@ LANG_USE_ONNX_SUBFUNCTIONS = False
 MXFP6_MATMUL = True
 MXINT8_KV_CACHE = True
 AIC_ENABLE_DEPTH_FIRST = True
+split_model_io = True
 compiler_kwargs = {
     "NUM_CORES": NUM_CORES,
     "NUM_DEVICES": NUM_DEVICES,
@@ -47,6 +48,7 @@ compiler_kwargs = {
     "USE_ONNX_SUBFUNCTIONS": USE_ONNX_SUBFUNCTIONS,
     "VISION_USE_ONNX_SUBFUNCTIONS": VISION_USE_ONNX_SUBFUNCTIONS,
     "LANG_USE_ONNX_SUBFUNCTIONS": LANG_USE_ONNX_SUBFUNCTIONS,
+    "split_model_io": split_model_io,
 }
 
 
@@ -56,13 +58,16 @@ def main():
     chat_template = (
         getattr(processor, "chat_template", None) or getattr(tokenizer, "chat_template", None) or CHAT_TEMPLATE
     )
-
+    config = AutoConfig.from_pretrained(MODEL_ID)
+    config.text_config.num_hidden_layers = 1
+    config.vision_config.num_hidden_layers = 1
     qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
         dtype="float32",
         kv_offload=True,
         skip_vision=SKIP_VISION,
+        config=config,
     )
 
     if SKIP_VISION:
@@ -94,6 +99,7 @@ def main():
             npi_mode=npi_mode,
             **compiler_kwargs,
         )
+        breakpooint()
         qeff_model.compile(**compile_kwargs)
 
         output = qeff_model.generate(inputs=text_inputs, generation_len=GENERATION_LEN)
@@ -130,10 +136,12 @@ def main():
         effective_ctx_len=effective_ctx_len,
         skip_vision=SKIP_VISION,
         npi_mode=npi_mode,
+        skip_model_io=True,
         **compiler_kwargs,
     )
+    breakpoint()
     qeff_model.compile(**compile_kwargs)
-
+    
     output = qeff_model.generate(
         inputs=inputs,
         generation_len=GENERATION_LEN,
