@@ -7,7 +7,7 @@ from gemma4_utils import (
     remove_fp16clip_transform_if_disabled,
     resolve_npi_mode,
 )
-from transformers import AutoProcessor, AutoConfig
+from transformers import AutoConfig, AutoProcessor
 
 from QEfficient import QEFFAutoModelForImageTextToText
 
@@ -59,8 +59,8 @@ def main():
         getattr(processor, "chat_template", None) or getattr(tokenizer, "chat_template", None) or CHAT_TEMPLATE
     )
     config = AutoConfig.from_pretrained(MODEL_ID)
-    config.text_config.num_hidden_layers = 1
-    config.vision_config.num_hidden_layers = 1
+    # config.text_config.num_hidden_layers = 1
+    # config.vision_config.num_hidden_layers = 1
     qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
@@ -99,7 +99,7 @@ def main():
             npi_mode=npi_mode,
             **compiler_kwargs,
         )
-        breakpooint()
+        # breakpooint()
         qeff_model.compile(**compile_kwargs)
 
         output = qeff_model.generate(inputs=text_inputs, generation_len=GENERATION_LEN)
@@ -139,9 +139,9 @@ def main():
         skip_model_io=True,
         **compiler_kwargs,
     )
-    breakpoint()
+    # breakpoint()
     qeff_model.compile(**compile_kwargs)
-    
+
     output = qeff_model.generate(
         inputs=inputs,
         generation_len=GENERATION_LEN,

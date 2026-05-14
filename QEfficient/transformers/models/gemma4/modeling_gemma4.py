@@ -5,10 +5,11 @@
 #
 # -----------------------------------------------------------------------------
 
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional, Type, Union
-import os
+
 import numpy as np
 import onnx
 import torch
@@ -30,12 +31,12 @@ from transformers.models.gemma4.modeling_gemma4 import (
 )
 
 from QEfficient.base.onnx_transforms import FP16ClipTransform
-from QEfficient.customop.rms_norm import CustomRMSNormFunc
 from QEfficient.customop.ctx_scatter_gather import (
     CtxGatherFunc3DGeneralized,
     CtxScatterFunc3DGeneralized,
     CtxScatterFunc3DInt,
 )
+from QEfficient.customop.rms_norm import CustomRMSNormFunc
 from QEfficient.transformers.cache_utils import QEffGemma4DynamicCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils import constants
@@ -163,6 +164,7 @@ class QEffGemma4CustomRMSNormAIC(Gemma4RMSNorm):
                 weight = hidden_states.new_ones(hidden_states.shape[-1])
         return CustomRMSNormFunc.apply(hidden_states, weight, self.eps)
 
+
 # For decode block
 # class QEffGemma4TextExperts(Gemma4TextExperts):
 #     def forward(
@@ -190,6 +192,8 @@ class QEffGemma4CustomRMSNormAIC(Gemma4RMSNorm):
 #         combine_weights = expert_weights.to(experts_out.dtype).unsqueeze(-1)  # [tokens, num_experts, 1]
 #         return torch.bmm(weighted_experts, combine_weights).squeeze(-1)
 
+
+# optimized prefill block
 class QEffGemma4TextExperts(Gemma4TextExperts):
     def _forward_expert_blocked(self, x: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
         T, H = x.shape
@@ -200,7 +204,7 @@ class QEffGemma4TextExperts(Gemma4TextExperts):
             )
         local_experts = self.num_experts // num_nsp
         rw = routing_weights.transpose(0, 1).contiguous().view(local_experts, num_nsp, T).transpose(0, 1).contiguous()
-        gate_proj_w, gate_up_w = self.gate_up_proj.chunk(2, dim=-1)  
+        gate_proj_w, gate_up_w = self.gate_up_proj.chunk(2, dim=-1)
         # breakpoint()
         W_g = gate_proj_w.reshape(local_experts, num_nsp, H, -1).transpose(0, 1).contiguous()
         W_u = gate_up_w.reshape(local_experts, num_nsp, H, -1).transpose(0, 1).contiguous()
@@ -222,55 +226,101 @@ class QEffGemma4TextExperts(Gemma4TextExperts):
                 packed_chunk_size=EXPERT_BLOCKING_PACKED_CHUNK_SIZE,
             )
         return expert_out.sum(dim=0)
+
     def forward(
-      self,
-      hidden_states: torch.Tensor,
-      top_k_index: torch.Tensor,
-      top_k_weights: torch.Tensor,
-  ) -> torch.Tensor:
-      # Supports [T, H] or [B, S, H]
-      if hidden_states.dim() == 3:
-          B, S, H = hidden_states.shape
-          x = hidden_states.view(B * S, H)
-          reshape_back = True
-      else:
-          T, H = hidden_states.shape
-          x = hidden_states
-          reshape_back = False
- 
-      T = x.shape[0]
- 
-      # Build dense routing weights [T, E] from top-k indices/weights
-      expert_weights = torch.zeros(
-          T,
-          self.num_experts,
-          dtype=top_k_weights.dtype,
-          device=top_k_weights.device,
-      )
-      expert_weights.scatter_add_(1, top_k_index, top_k_weights)
-      expert_weights = expert_weights.to(x.dtype)
- 
-      # Accumulate expert outputs
-      if self.num_experts % EXPERT_BLOCKING_NUM_NSP == 0:
-            out = self._forward_expert_blocked(x=x, routing_weights=expert_weights)
-            # breakpoint()
-            return out
-      out = x.new_zeros((T, H))
-      for e in range(self.num_experts):
-          w = expert_weights[:, e].unsqueeze(-1)  # [T, 1]
- 
-          # gate_up_proj[e]: [2I, H], down_proj[e]: [H, I] (matching your original matmuls)
-          gate_up = x @ self.gate_up_proj[e].transpose(0, 1)  # [T, 2I]
-          gate, up = gate_up.chunk(2, dim=-1)                 # [T, I], [T, I]
-          activated = self.act_fn(gate) * up                  # [T, I]
-          down = activated @ self.down_proj[e].transpose(0, 1)  # [T, H]
- 
-          out += down * w
- 
-      if reshape_back:
-          return out.view(B, S, H)
-      return out
-        
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.dim() == 3:
+            B, S, H = hidden_states.shape
+            x = hidden_states.view(B * S, H)
+            reshape_back = True
+        else:
+            T, H = hidden_states.shape
+            x = hidden_states
+            reshape_back = False
+
+        T = x.shape[0]
+
+        # Build dense routing weights [T, E] from top-k indices/weights
+        expert_weights = torch.zeros(
+            T,
+            self.num_experts,
+            dtype=top_k_weights.dtype,
+            device=top_k_weights.device,
+        )
+        expert_weights.scatter_add_(1, top_k_index, top_k_weights)
+        expert_weights = expert_weights.to(x.dtype)
+        #   breakpoint()
+        # Accumulate expert outputs
+        #   if self.num_experts % EXPERT_BLOCKING_NUM_NSP == 0:
+        #         out = self._forward_expert_blocked(x=x, routing_weights=expert_weights)
+        #         return out
+        out = x.new_zeros((T, H))
+        for e in range(self.num_experts):
+            w = expert_weights[:, e].unsqueeze(-1)  # [T, 1]
+
+            # gate_up_proj[e]: [2I, H], down_proj[e]: [H, I] (matching your original matmuls)
+            gate_up = x @ self.gate_up_proj[e].transpose(0, 1)  # [T, 2I]
+            gate, up = gate_up.chunk(2, dim=-1)  # [T, I], [T, I]
+            activated = self.act_fn(gate) * up  # [T, I]
+            down = activated @ self.down_proj[e].transpose(0, 1)  # [T, H]
+
+            out += down * w
+
+        if reshape_back:
+            return out.view(B, S, H)
+        return out
+
+
+# prefill block
+# class QEffGemma4TextExperts(Gemma4TextExperts):
+#     def forward(
+#       self,
+#       hidden_states: torch.Tensor,
+#       top_k_index: torch.Tensor,
+#       top_k_weights: torch.Tensor,
+#   ) -> torch.Tensor:
+#       # Supports [T, H] or [B, S, H]
+#       if hidden_states.dim() == 3:
+#           B, S, H = hidden_states.shape
+#           x = hidden_states.view(B * S, H)
+#           reshape_back = True
+#       else:
+#           T, H = hidden_states.shape
+#           x = hidden_states
+#           reshape_back = False
+
+#       T = x.shape[0]
+
+#       # Build dense routing weights [T, E] from top-k indices/weights
+#       expert_weights = torch.zeros(
+#           T,
+#           self.num_experts,
+#           dtype=top_k_weights.dtype,
+#           device=top_k_weights.device,
+#       )
+#       expert_weights.scatter_add_(1, top_k_index, top_k_weights)
+#       expert_weights = expert_weights.to(x.dtype)
+
+#       # Accumulate expert outputs
+#       out = x.new_zeros((T, H))
+#       for e in range(self.num_experts):
+#           w = expert_weights[:, e].unsqueeze(-1)  # [T, 1]
+
+#           # gate_up_proj[e]: [2I, H], down_proj[e]: [H, I] (matching your original matmuls)
+#           gate_up = x @ self.gate_up_proj[e].transpose(0, 1)  # [T, 2I]
+#           gate, up = gate_up.chunk(2, dim=-1)                 # [T, I], [T, I]
+#           activated = self.act_fn(gate) * up                  # [T, I]
+#           down = activated @ self.down_proj[e].transpose(0, 1)  # [T, H]
+
+#           out += down * w
+
+#       if reshape_back:
+#           return out.view(B, S, H)
+#       return out
 
 
 class QEffGemma4TextAttention(Gemma4TextAttention):
@@ -353,8 +403,9 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+
 EXPERT_BLOCKING_NUM_NSP = int(os.environ.get("EXPERT_BLOCKING_NUM_NSP", "16"))
-EXPERT_BLOCKING_PACKED_CHUNK_SIZE = int(os.environ.get("EXPERT_BLOCKING_PACKED_CHUNK_SIZE", "256"))
+EXPERT_BLOCKING_PACKED_CHUNK_SIZE = int(os.environ.get("EXPERT_BLOCKING_PACKED_CHUNK_SIZE", "296"))
 
 
 def _build_matched_idx_from_cumsum(T2Ei: torch.Tensor) -> torch.Tensor:
@@ -429,12 +480,14 @@ def _cumsum_scatter_gather_update_expert_blocked(
         updated_chunk = expert_out_chunk + down_chunk
 
         chunk_valid_rows = torch.clamp(valid_rows - packed_start, min=0, max=packed_chunk_size)
+        # breakpoint()
         updated_chunk = torch.where(
             (row_range < chunk_valid_rows).unsqueeze(-1), updated_chunk, torch.zeros_like(updated_chunk)
         )
         expert_out = CtxScatterFunc3DGeneralized.apply(expert_out, chunk_matched_idx, updated_chunk)
 
     return expert_out
+
 
 class QEffGemma4TextDecoderLayer(Gemma4TextDecoderLayer):
     def forward(
