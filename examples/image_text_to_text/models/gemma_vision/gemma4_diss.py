@@ -27,8 +27,8 @@ model_id = "google/gemma-4-26B-A4B-it"
 config = AutoConfig.from_pretrained(model_id)
 
 # For faster execution user can run with lesser layers, For Testing Purpose Only
-# config.text_config.num_hidden_layers = 2
-# config.vision_config.num_hidden_layers = 2
+config.text_config.num_hidden_layers = 2
+config.vision_config.num_hidden_layers = 2
 
 qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
     model_id, attn_implementation="eager", kv_offload=True, config=config, dtype="float32", trust_remote_code=True
@@ -60,6 +60,7 @@ if not skip_vision:
         aic_enable_depth_first=True,
         skip_vision=skip_vision,
         split_model_io=True,
+        node_precision_info=True,
         skip_lang=True,
     )
 prefill_qpc_path = qeff_model.compile(
@@ -199,6 +200,7 @@ vision_start = perf_counter()
 vision_outputs = {}
 if vision_inputs:
     vision_outputs = vision_session.run(vision_inputs)
+breakpoint()
 vision_end = perf_counter()
 
 lang_inputs = {k: v for k, v in inputs.items() if k not in vision_inputs}
