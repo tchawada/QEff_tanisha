@@ -100,8 +100,22 @@ class QEffDynamicLayer(CacheLayerMixin):
             self.device = reference_states.device
             self.is_initialized = True
 
-    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
-        return self.get_seq_length() + cache_position.shape[0], 0
+    def get_mask_sizes(self, cache_position: torch.Tensor | int) -> tuple[int, int]:
+        if isinstance(cache_position, int):
+            # transformers>=5 can pass query length as an int during decode.
+            # QEff preallocated KV caches already include current decode slot width.
+            return self.get_seq_length(), 0
+        elif torch.is_tensor(cache_position):
+            if cache_position.ndim == 0:
+                query_length = 1
+            elif cache_position.ndim == 1:
+                query_length = cache_position.shape[0]
+            else:
+                query_length = cache_position.shape[-1]
+        else:
+            # Keep backward compatibility with scalar-like objects.
+            query_length = int(cache_position)
+        return self.get_seq_length() + int(query_length), 0
 
     def get_seq_length(self) -> int:
         return self.keys.shape[-2] if self.keys is not None else 0
@@ -1023,8 +1037,26 @@ class QEffSlidingWindowCache:
         """Returns seen token length (logical sequence length)."""
         return self.seen_tokens
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> Tuple[int, int]:
-        query_length = cache_position.shape[0]
+    def get_mask_sizes(self, cache_position: torch.Tensor | int, layer_idx: int) -> Tuple[int, int]:
+        if torch.onnx.is_in_onnx_export():
+            # During export we trace with preallocated retained-state buffers.
+            # Mask width must match the physical KV width used by attention ops.
+            if layer_idx < len(self.key_cache):
+                layer_keys = self.key_cache[layer_idx]
+                if layer_keys is not None:
+                    return int(layer_keys.shape[-2]), 0
+
+        if isinstance(cache_position, int):
+            query_length = cache_position
+        elif torch.is_tensor(cache_position):
+            if cache_position.ndim == 0:
+                query_length = 1
+            elif cache_position.ndim == 1:
+                query_length = cache_position.shape[0]
+            else:
+                query_length = cache_position.shape[-1]
+        else:
+            query_length = int(cache_position)
         layer_types = getattr(self.config, "layer_types", None)
         is_sliding_layer = bool(
             layer_types is not None and layer_idx < len(layer_types) and layer_types[layer_idx] == "sliding_attention"
@@ -1132,12 +1164,45 @@ class QEffSlidingWindowCache:
 
 
 class QEffHybridCacheForGPTOSS:
-    def __init__(self, config, batch_size, max_cache_len, sliding_window_len):
-        self.max_cache_len = max_cache_len
-        self.batch_size = batch_size
-        self.sliding_window_len = sliding_window_len
+    def __init__(self, config, batch_size=None, max_cache_len=None, sliding_window_len=None):
+        self.config = config
+        self.max_cache_len = (
+            max_cache_len if max_cache_len is not None else getattr(config, "max_position_embeddings", None)
+        )
+        self.batch_size = batch_size if batch_size is not None else 1
+        self.sliding_window_len = (
+            sliding_window_len if sliding_window_len is not None else getattr(config, "sliding_window", None)
+        )
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
+        # Track absolute generated tokens so position ids remain monotonic with sliding-window layers.
+        self._seen_tokens = 0
+
+    def _normalize_cache_kwargs(
+        self,
+        layer_idx: int,
+        key_states: torch.Tensor,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cache_kwargs = dict(cache_kwargs) if cache_kwargs is not None else {}
+        position_ids = cache_kwargs.get("position_ids")
+
+        # For KV-shared paths, callers may pass full-seq position_ids while updating token-length KV.
+        # Aligning prevents scatter/gather index drift.
+        if position_ids is not None and hasattr(position_ids, "shape"):
+            token_len = key_states.shape[-2]
+            if position_ids.shape[-1] != token_len:
+                cache_kwargs["position_ids"] = position_ids[..., -token_len:]
+
+        if cache_kwargs.get("is_sliding") is None:
+            layer_types = getattr(self.config, "layer_types", None)
+            if layer_types is not None and layer_idx < len(layer_types):
+                cache_kwargs["is_sliding"] = layer_types[layer_idx] == "sliding_attention"
+
+        if cache_kwargs.get("sliding_window") is None and cache_kwargs.get("is_sliding"):
+            cache_kwargs["sliding_window"] = self.sliding_window_len
+
+        return cache_kwargs
 
     @classmethod
     def from_legacy_cache(
@@ -1145,16 +1210,22 @@ class QEffHybridCacheForGPTOSS:
     ) -> "HybridCache":
         """Converts a cache in the legacy cache format into an equivalent `DynamicCache`. Used for
         backward compatibility."""
+        if past_key_values is None or len(past_key_values) == 0:
+            return cls(config)
+
+        cache_lens = [layer[0].shape[2] for layer in past_key_values]
+        max_cache_len = max(cache_lens)
+        sliding_window_len = getattr(config, "sliding_window", min(cache_lens))
         cache = cls(
             config,
             batch_size=past_key_values[0][0].shape[0],
-            max_cache_len=past_key_values[1][0].shape[2],
-            sliding_window_len=past_key_values[0][0].shape[2],
+            max_cache_len=max_cache_len,
+            sliding_window_len=sliding_window_len,
         )
-        if past_key_values is not None:
-            for layer_idx in range(len(past_key_values)):
-                key_states, value_states = past_key_values[layer_idx]
-                cache.update(key_states, value_states, layer_idx)
+        for layer_idx in range(len(past_key_values)):
+            key_states, value_states = past_key_values[layer_idx]
+            cache.update(key_states, value_states, layer_idx)
+            cache._seen_tokens = max(cache._seen_tokens, key_states.shape[-2])
         return cache
 
     def __len__(self):
@@ -1167,6 +1238,9 @@ class QEffHybridCacheForGPTOSS:
     def get_seq_length(self, layer_idx: Optional[int] = 0, cache_position: Optional[torch.LongTensor] = None) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
         # TODO: deprecate this function in favor of `cache_position`
+        if self._seen_tokens > 0:
+            return self._seen_tokens
+
         is_empty_layer = (
             len(self.key_cache) == 0  # no cache in any layer
             or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
@@ -1190,6 +1264,9 @@ class QEffHybridCacheForGPTOSS:
         layer_idx: int,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cache_kwargs = self._normalize_cache_kwargs(layer_idx, key_states, cache_kwargs)
+        position_ids = None if cache_kwargs is None else cache_kwargs.get("position_ids")
+
         if len(self.key_cache) <= layer_idx:
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
@@ -1221,6 +1298,10 @@ class QEffHybridCacheForGPTOSS:
                     self.value_cache[layer_idx], kv_position_ids, value_states
                 )
             k_out, v_out = self.key_cache[layer_idx], self.value_cache[layer_idx]
+        if position_ids is not None:
+            self._seen_tokens = max(self._seen_tokens, int(position_ids.max().item()) + 1)
+        else:
+            self._seen_tokens = max(self._seen_tokens, int(k_out.shape[-2]))
         return k_out, v_out
 
     def read_only_blockedKV(
@@ -1264,6 +1345,9 @@ class QEffHybridCacheForGPTOSS:
         layer_idx: int,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cache_kwargs = self._normalize_cache_kwargs(layer_idx, key_states, cache_kwargs)
+        position_ids = None if cache_kwargs is None else cache_kwargs.get("position_ids")
+
         if len(self.key_cache) <= layer_idx:
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
@@ -1322,6 +1406,10 @@ class QEffHybridCacheForGPTOSS:
                 v_out = CtxGatherFunc.apply(v_out, ctx_indices, ctx_len)
 
             v_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
+        if position_ids is not None:
+            self._seen_tokens = max(self._seen_tokens, int(position_ids.max().item()) + 1)
+        else:
+            self._seen_tokens = max(self._seen_tokens, int(k_out.shape[-2]))
         return k_out, v_out
 
     def full_cache_update_chunked(
@@ -1434,6 +1522,7 @@ class QEffGemma4DynamicCache(QEffDynamicCache):
                     key_states,
                     value_states,
                     is_sliding=self._is_sliding_layer(layer_idx),
+                    sliding_window=self._get_sliding_window() if self._is_sliding_layer(layer_idx) else None,
                 )
 
     def _is_sliding_layer(self, layer_idx: int) -> bool:
@@ -1442,9 +1531,18 @@ class QEffGemma4DynamicCache(QEffDynamicCache):
             layer_types is not None and layer_idx < len(layer_types) and layer_types[layer_idx] == "sliding_attention"
         )
 
+    def _get_sliding_window(self) -> Optional[int]:
+        return getattr(self.config, "sliding_window", None)
+
     def append_new_layers(self, layer_idx: int) -> None:
         while len(self.layers) <= layer_idx:
-            self.layers.append(QEffGemma4DynamicLayer(is_sliding=self._is_sliding_layer(len(self.layers))))
+            is_sliding = self._is_sliding_layer(len(self.layers))
+            self.layers.append(
+                QEffGemma4DynamicLayer(
+                    is_sliding=is_sliding,
+                    sliding_window=self._get_sliding_window() if is_sliding else None,
+                )
+            )
 
     @classmethod
     def from_legacy_cache(
@@ -1460,6 +1558,7 @@ class QEffGemma4DynamicCache(QEffDynamicCache):
                     key_states,
                     value_states,
                     is_sliding=cache._is_sliding_layer(layer_idx),
+                    sliding_window=cache._get_sliding_window() if cache._is_sliding_layer(layer_idx) else None,
                 )
         return cache
 
@@ -1476,24 +1575,105 @@ class QEffGemma4DynamicCache(QEffDynamicCache):
                 key_states,
                 value_states,
                 is_sliding=cache._is_sliding_layer(layer_idx),
+                sliding_window=cache._get_sliding_window() if cache._is_sliding_layer(layer_idx) else None,
             )
         return cache
 
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Gemma4 initializes with an empty layer list and per-layer sliding/full
+        # behavior, so we must create layers lazily before delegating to Cache.update.
+        self.append_new_layers(layer_idx)
+        return super().update(key_states, value_states, layer_idx, cache_kwargs)
+
 
 class QEffGemma4DynamicLayer(QEffDynamicLayer):
-    def __init__(self, is_sliding: bool = False):
+    def __init__(self, is_sliding: bool = False, sliding_window: Optional[int] = None):
         super().__init__()
         self.is_sliding = is_sliding
+        self.sliding_window = sliding_window
+        self.cumulative_length = 0
 
     @classmethod
     def from_tensors(
-        cls, key_states: torch.Tensor, value_states: torch.Tensor, is_sliding: bool = False
+        cls,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        is_sliding: bool = False,
+        sliding_window: Optional[int] = None,
     ) -> "QEffGemma4DynamicLayer":
-        layer = cls(is_sliding=is_sliding)
+        layer = cls(is_sliding=is_sliding, sliding_window=sliding_window)
         layer.keys = key_states
         layer.values = value_states
         layer._mark_initialized(key_states)
+        layer.cumulative_length = key_states.shape[-2]
         return layer
+
+    def get_seq_length(self) -> int:
+        if self.is_sliding:
+            return int(self.cumulative_length)
+        return super().get_seq_length()
+
+    def get_mask_sizes(self, cache_position: torch.Tensor | int) -> tuple[int, int]:
+        if not self.is_sliding:
+            if isinstance(cache_position, int):
+                # In decode with preallocated caches, avoid counting an extra token.
+                return int(self.get_seq_length()), 0
+            elif torch.is_tensor(cache_position):
+                if cache_position.ndim == 0:
+                    query_length = 1
+                elif cache_position.ndim == 1:
+                    query_length = cache_position.shape[0]
+                else:
+                    query_length = cache_position.shape[-1]
+            else:
+                query_length = int(cache_position)
+
+            seq_length = self.get_seq_length()
+            # Export/prefill paths can provide full-sequence query lengths with
+            # preallocated KV tensors; in that mode we should not double-count.
+            if query_length > 1 and seq_length >= query_length:
+                return int(seq_length), 0
+            return int(seq_length + query_length), 0
+
+        if self.sliding_window is None:
+            return super().get_mask_sizes(cache_position)
+
+        if isinstance(cache_position, int):
+            kv_offset = max(self.cumulative_length - self.sliding_window + 1, 0)
+            kv_length = min(self.cumulative_length, self.sliding_window)
+            return int(kv_length), int(kv_offset)
+        elif torch.is_tensor(cache_position):
+            if cache_position.ndim == 0:
+                query_length = 1
+            elif cache_position.ndim == 1:
+                query_length = cache_position.shape[0]
+            else:
+                query_length = cache_position.shape[-1]
+        else:
+            query_length = int(cache_position)
+
+        if query_length > 1 and self.cumulative_length >= query_length:
+            kv_offset = max(self.cumulative_length - self.sliding_window + 1, 0)
+            kv_length = (
+                min(self.cumulative_length, self.sliding_window)
+                if self.sliding_window is not None
+                else self.cumulative_length
+            )
+            return int(kv_length), int(kv_offset)
+
+        is_full = self.cumulative_length >= self.sliding_window
+        kv_offset = max(self.cumulative_length - self.sliding_window + 1, 0)
+        if is_full:
+            kv_length = self.sliding_window - 1 + int(query_length)
+        else:
+            kv_length = self.cumulative_length + int(query_length)
+        return int(kv_length), int(kv_offset)
 
     def update(
         self,
@@ -1501,19 +1681,64 @@ class QEffGemma4DynamicLayer(QEffDynamicLayer):
         value_states: torch.Tensor,
         cache_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.is_sliding or cache_kwargs is None:
+        if not self.is_sliding:
+            if self.keys is None:
+                self.keys = key_states
+                self.values = value_states
+                self._mark_initialized(self.keys)
+                return self.keys, self.values
+
+            self._mark_initialized(self.keys)
+            position_ids = None if cache_kwargs is None else cache_kwargs.get("position_ids")
+            should_grow = (
+                not torch.onnx.is_in_onnx_export()
+                and position_ids is not None
+                and int(position_ids.max().item()) >= self.keys.shape[2]
+            )
+            if should_grow:
+                # Gemma4 full-attention layers should grow dynamically during decode.
+                self.keys = torch.cat([self.keys, key_states], dim=-2)
+                self.values = torch.cat([self.values, value_states], dim=-2)
+                return self.keys, self.values
+
+            return super().update(key_states, value_states, cache_kwargs)
+
+        if cache_kwargs is None:
             return super().update(key_states, value_states, cache_kwargs)
 
         if self.keys is None:
-            self.keys = key_states
-            self.values = value_states
+            # HF DynamicSlidingWindowLayer semantics:
+            # return full states for current attention, but store only last
+            # `sliding_window - 1` states when sliding mode is active.
+            self.cumulative_length += key_states.shape[-2]
+            if self.sliding_window is not None and self.sliding_window > 1:
+                self.keys = key_states[:, :, -self.sliding_window + 1 :, :]
+                self.values = value_states[:, :, -self.sliding_window + 1 :, :]
+            else:
+                self.keys = key_states
+                self.values = value_states
             self._mark_initialized(self.keys)
-            return self.keys, self.values
+            return key_states, value_states
 
         self._mark_initialized(self.keys)
         position_ids = cache_kwargs.get("position_ids")
         batch_index = cache_kwargs.get("batch_index", None)
         layer_ctx_len = self.keys.shape[2]
+        sliding_window = cache_kwargs.get("sliding_window", self.sliding_window)
+
+        if position_ids is None or int(position_ids.max().item()) >= layer_ctx_len:
+            # HF-aligned dynamic sliding behavior: return full KV for attention,
+            # while retaining only recent sliding window states in cache.
+            full_key_states = torch.cat([self.keys, key_states], dim=-2)
+            full_value_states = torch.cat([self.values, value_states], dim=-2)
+            self.cumulative_length += key_states.shape[-2]
+            if sliding_window is not None and sliding_window > 1:
+                self.keys = full_key_states[:, :, -sliding_window + 1 :, :]
+                self.values = full_value_states[:, :, -sliding_window + 1 :, :]
+            else:
+                self.keys = full_key_states
+                self.values = full_value_states
+            return full_key_states, full_value_states
 
         kv_position_ids = torch.where(position_ids == -1, position_ids, position_ids % layer_ctx_len)
         kv_position_ids = torch.where(
@@ -1562,4 +1787,5 @@ class QEffGemma4DynamicLayer(QEffDynamicLayer):
         v_ctx_out = torch.where(invalid_mask.unsqueeze(-1), torch.tensor(0.0, dtype=torch.float32), v_out)
         k_out = torch.where(use_rolling_indices, k_out, k_ctx_out)
         v_out = torch.where(use_rolling_indices, v_out, v_ctx_out)
+        self.cumulative_length = max(self.cumulative_length, int(position_ids.max().item()) + 1)
         return k_out, v_out

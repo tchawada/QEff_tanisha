@@ -16,7 +16,7 @@ from transformers import TextStreamer
 from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 
 from QEfficient.generation.text_generation_inference import TextGeneration
-from QEfficient.transformers.cache_utils import QEffDynamicCache
+from QEfficient.transformers.cache_utils import QEffDynamicCache, QEffGemma4DynamicCache
 from QEfficient.utils.generate_inputs import InputHandler, InputHandlerInternVL, InputHandlerVLM
 
 
@@ -399,24 +399,104 @@ class ApiRunnerVlm:
         return generated_ids
 
     @torch.no_grad()
-    def run_vlm_hf_model_on_pytorch(self, model, inputs):
-        output = model.generate(**inputs, max_new_tokens=self.gen_len, do_sample=False)
-        offset_output = output[0, inputs["input_ids"].shape[1] :]
+    def run_vlm_hf_model_on_pytorch(self, model, inputs, return_step_logits: bool = False):
+        if return_step_logits:
+            output = model.generate(
+                **inputs,
+                max_new_tokens=self.gen_len,
+                do_sample=False,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+            offset_output = output.sequences[0, inputs["input_ids"].shape[1] :]
+            step_logits = [score.detach().cpu().float().numpy() for score in output.scores]
+        else:
+            output = model.generate(**inputs, max_new_tokens=self.gen_len, do_sample=False)
+            offset_output = output[0, inputs["input_ids"].shape[1] :]
+            step_logits = None
         py_output = self.processor.tokenizer.decode(offset_output).strip()
         print("Original HF Model Outputs (Torch CPU):")
         print("Completion:", repr(py_output))
+        if return_step_logits:
+            return offset_output, step_logits
         return offset_output
 
     @torch.no_grad()
-    def run_vlm_kv_model_on_pytorch(self, model):
+    def run_vlm_kv_model_on_pytorch(self, model, return_step_logits: bool = False):
+        model_cfg = getattr(model, "config", None)
+        model_type = str(getattr(model_cfg, "model_type", ""))
+
+        def _gemma4_cache_config():
+            if hasattr(model, "model") and hasattr(model.model, "language_model"):
+                return model.model.language_model.config
+            if hasattr(model, "language_model"):
+                return model.language_model.config
+            if hasattr(model_cfg, "text_config"):
+                return model_cfg.text_config
+            return model_cfg
+
+        def _empty_gemma4_cache():
+            return QEffGemma4DynamicCache(config=_gemma4_cache_config())
+
+        def _next_image_idx(outputs, current_image_idx):
+            if hasattr(outputs, "image_idx") and outputs.image_idx is not None:
+                return outputs.image_idx
+            try:
+                output_tuple = outputs.to_tuple() if hasattr(outputs, "to_tuple") else tuple(outputs)
+                if len(output_tuple) > 2:
+                    return output_tuple[2]
+            except Exception:
+                pass
+            return current_image_idx
+
+        def _as_vlm_cache_object(past_key_values):
+            if not isinstance(past_key_values, (list, tuple)) or len(past_key_values) == 0:
+                return past_key_values
+            first = past_key_values[0]
+            if not isinstance(first, (list, tuple)) or len(first) != 2:
+                return past_key_values
+
+            if model_type.startswith("gemma4"):
+                cache_cfg = None
+                if hasattr(model, "model") and hasattr(model.model, "language_model"):
+                    cache_cfg = model.model.language_model.config
+                elif hasattr(model, "language_model"):
+                    cache_cfg = model.language_model.config
+                elif hasattr(model_cfg, "text_config"):
+                    cache_cfg = model_cfg.text_config
+                else:
+                    cache_cfg = model_cfg
+                return QEffGemma4DynamicCache.from_legacy_cache(cache_cfg, past_key_values)
+            if model_type.startswith("gemma3"):
+                return DynamicCache(past_key_values)
+
+            return past_key_values
+
         generation_len = self.gen_len
         generated_ids = torch.full((self.batch_size, generation_len), self.processor.tokenizer.pad_token_id)
         inputs = self.input_handler_vlm.prepare_pytorch_inputs()
         inputs["image_idx"] = torch.tensor([[0]])
+        if model_type.startswith("gemma4"):
+            inputs["past_key_values"] = _empty_gemma4_cache()
+        elif "past_key_values" in inputs:
+            inputs["past_key_values"] = _as_vlm_cache_object(inputs["past_key_values"])
 
         outputs = model(**inputs)
-        inputs["input_ids"] = outputs[0].argmax(2)
-        inputs["image_idx"] = outputs[2]
+        step_logits = [] if return_step_logits else None
+        logits = outputs[0]
+        if logits.ndim == 3 and logits.shape[1] > 1:
+            logits = logits[:, -1:, :]
+        if return_step_logits:
+            last_logits = logits[:, -1, :] if logits.ndim == 3 else logits
+            step_logits.append(last_logits.detach().cpu().float().numpy())
+        inputs["input_ids"] = logits.argmax(2)
+        inputs["image_idx"] = _next_image_idx(outputs, inputs.get("image_idx"))
+        if "past_key_values" in inputs and hasattr(outputs, "past_key_values"):
+            inputs["past_key_values"] = _as_vlm_cache_object(outputs.past_key_values)
+        if model_type.startswith("gemma4"):
+            inputs.pop("pixel_values", None)
+        if "mm_token_type_ids" in inputs:
+            inputs["mm_token_type_ids"] = torch.zeros_like(inputs["input_ids"], dtype=inputs["mm_token_type_ids"].dtype)
         if "cross_attention_mask" in inputs:
             bs, _, num_images, img_tiles = inputs["cross_attention_mask"].shape
             inputs["cross_attention_mask"] = torch.ones((bs, 1, num_images, img_tiles), dtype=torch.int64)
@@ -430,8 +510,20 @@ class ApiRunnerVlm:
         streamer.put(inputs["input_ids"])
         for num_token in range(1, self.gen_len):
             outputs = model(**inputs)
-            inputs["input_ids"] = outputs[0].argmax(2)
-            inputs["image_idx"] = outputs[2]
+            logits = outputs[0]
+            if logits.ndim == 3 and logits.shape[1] > 1:
+                logits = logits[:, -1:, :]
+            if return_step_logits:
+                last_logits = logits[:, -1, :] if logits.ndim == 3 else logits
+                step_logits.append(last_logits.detach().cpu().float().numpy())
+            inputs["input_ids"] = logits.argmax(2)
+            inputs["image_idx"] = _next_image_idx(outputs, inputs.get("image_idx"))
+            if "past_key_values" in inputs and hasattr(outputs, "past_key_values"):
+                inputs["past_key_values"] = _as_vlm_cache_object(outputs.past_key_values)
+            if "mm_token_type_ids" in inputs:
+                inputs["mm_token_type_ids"] = torch.zeros_like(
+                    inputs["input_ids"], dtype=inputs["mm_token_type_ids"].dtype
+                )
             inputs["position_ids"] += 1
             streamer.put(inputs["input_ids"])
             generated_ids[:, num_token] = inputs["input_ids"].squeeze(1)
@@ -439,6 +531,8 @@ class ApiRunnerVlm:
             if finished_sequences.all():
                 break
         streamer.end()
+        if return_step_logits:
+            return generated_ids[0], step_logits
         return generated_ids[0]
 
     def run_ort_session(self, inputs, session) -> dict:

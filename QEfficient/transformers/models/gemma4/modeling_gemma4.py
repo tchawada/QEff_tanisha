@@ -88,11 +88,30 @@ def _build_additive_attention_mask(
     target_length,
     dtype: torch.dtype,
     sliding_window: Optional[int] = None,
+    start_index: int = 0,
 ) -> torch.Tensor:
+    if start_index:
+        query_indices = position_ids.unsqueeze(-1)
+        kv_indices = torch.arange(
+            start=start_index,
+            end=start_index + int(target_length),
+            device=position_ids.device,
+        ).view(1, 1, -1)
+        if sliding_window is not None:
+            causal_mask = kv_indices > query_indices
+            window_indices = query_indices - sliding_window + 1
+            window_mask = kv_indices < window_indices
+            causal_mask = causal_mask | window_mask
+        else:
+            causal_mask = kv_indices > query_indices
+        causal_mask = causal_mask.unsqueeze(1)
+        return causal_mask.to(dtype=dtype) * _attention_mask_min(dtype, causal_mask.device)
+
     causal_mask = _create_causal_mask(
         position_ids=position_ids,
         target_length=target_length,
         sliding_window=sliding_window,
+        start_index=start_index,
     )
     return causal_mask.to(dtype=dtype) * _attention_mask_min(dtype, causal_mask.device)
 
@@ -124,14 +143,45 @@ def _build_bidirectional_vision_attention_mask(
     vision_group_ids = torch.cumsum(new_vision_starts.to(torch.int64), dim=1) - 1
     vision_group_ids = torch.where(is_vision, vision_group_ids, torch.full_like(vision_group_ids, -1))
 
-    kv_indices = torch.arange(target_length, device=vision_group_ids.device, dtype=torch.int64).view(1, -1)
-    seq_len_limit = torch.full_like(kv_indices, vision_group_ids.shape[1] - 1)
-    safe_kv_indices = torch.minimum(kv_indices, seq_len_limit)
-    kv_group_ids = torch.gather(vision_group_ids, 1, safe_kv_indices.expand(vision_group_ids.shape[0], -1))
-    kv_group_ids = torch.where(kv_indices < vision_group_ids.shape[1], kv_group_ids, torch.full_like(kv_group_ids, -1))
+    batch_size = vision_group_ids.shape[0]
+    seq_len = vision_group_ids.shape[1]
+    q_positions = position_ids.to(torch.int64)
 
-    same_group = (vision_group_ids.unsqueeze(-1) == kv_group_ids.unsqueeze(1)) & (vision_group_ids.unsqueeze(-1) >= 0)
-    attention_mask = base_mask & ~same_group.unsqueeze(1)
+    # Query group ids are indexed by current position_ids to stay aligned with cache updates.
+    safe_q_positions = q_positions.clamp(min=0, max=max(seq_len - 1, 0))
+    q_group_ids = torch.gather(vision_group_ids, 1, safe_q_positions)
+    q_valid = (q_positions >= 0) & (q_positions < seq_len)
+    q_group_ids = torch.where(q_valid, q_group_ids, torch.full_like(q_group_ids, -1))
+
+    kv_indices = torch.arange(target_length, device=vision_group_ids.device, dtype=torch.int64).view(1, -1)
+    if sliding_window is not None:
+        # Mirror _create_causal_mask's rolling-buffer kv index mapping.
+        pos_max = q_positions.max(1, keepdim=True).values
+        kv_start = (pos_max // target_length) * target_length
+        kv_indices_high = kv_indices + kv_start
+        kv_indices_low = torch.where(kv_indices_high < target_length, kv_indices, kv_indices_high - target_length)
+        kv_positions = torch.where(kv_indices_high > pos_max, kv_indices_low, kv_indices_high)
+    else:
+        kv_positions = kv_indices.expand(batch_size, -1)
+
+    safe_kv_positions = kv_positions.clamp(min=0, max=max(seq_len - 1, 0))
+    kv_group_ids = torch.gather(vision_group_ids, 1, safe_kv_positions)
+    kv_valid = (kv_positions >= 0) & (kv_positions < seq_len)
+    kv_group_ids = torch.where(kv_valid, kv_group_ids, torch.full_like(kv_group_ids, -1))
+
+    same_group = (q_group_ids.unsqueeze(-1) == kv_group_ids.unsqueeze(1)) & (q_group_ids.unsqueeze(-1) >= 0)
+
+    if sliding_window is not None:
+        # Keep sliding-window restriction: window OR (causal AND not blockwise).
+        query_indices = q_positions.unsqueeze(-1)
+        kv_for_mask = kv_positions.unsqueeze(1)
+        causal_mask = kv_for_mask > query_indices
+        window_indices = query_indices - sliding_window + 1
+        window_mask = kv_for_mask < window_indices
+        attention_mask = window_mask | (causal_mask & ~same_group)
+        attention_mask = attention_mask.unsqueeze(1)
+    else:
+        attention_mask = base_mask & ~same_group.unsqueeze(1)
     return attention_mask.to(dtype=dtype) * _attention_mask_min(dtype, attention_mask.device)
 
 
@@ -409,13 +459,18 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
         position_ids: Optional[torch.LongTensor] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
+        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        cache_kwargs = {"position_ids": position_ids, "batch_index": batch_index}
-        token_key_states = None
-        token_value_states = None
+        use_mm_bidirectional_mask = kwargs.pop("use_mm_bidirectional_mask", True)
+        cache_kwargs = {
+            "position_ids": position_ids,
+            "batch_index": batch_index,
+            "is_sliding": self.is_sliding,
+            "sliding_window": self.sliding_window,
+        }
 
         cos, sin = position_embeddings
 
@@ -423,15 +478,22 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
         query_states = self.q_norm(query_states)
         query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
         query_states = query_states.transpose(1, 2)
-
+        if past_key_values is not None:
+            if comp_ctx_lengths is not None:
+                attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
+                cache_kwargs["CCL"] = attention_mask.shape[-1]
         if self.is_kv_shared_layer and past_key_values is not None:
+            if (
+                not hasattr(past_key_values, "shared_layers")
+                or self.kv_shared_layer_index not in past_key_values.shared_layers
+            ):
+                raise RuntimeError(
+                    f"Missing shared KV states for shared layer {self.layer_idx} "
+                    f"(source layer {self.kv_shared_layer_index})."
+                )
             key_states, value_states = past_key_values.shared_layers[self.kv_shared_layer_index]
             key_states = key_states.to(query_states.device)
             value_states = value_states.to(query_states.device)
-            if hasattr(past_key_values, "shared_layers_token"):
-                token_states = past_key_values.shared_layers_token.get(self.kv_shared_layer_index)
-                if token_states is not None:
-                    token_key_states, token_value_states = token_states
         else:
             key_states = self.k_proj(hidden_states).view(hidden_shape)
             value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
@@ -442,37 +504,25 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
 
             value_states = self.v_norm(value_states)
             value_states = value_states.transpose(1, 2)
-            token_key_states, token_value_states = key_states, value_states
 
-        if past_key_values is not None:
-            if self.is_kv_shared_layer:
-                if token_key_states is not None and token_value_states is not None:
-                    key_states, value_states = past_key_values.update(
-                        token_key_states,
-                        token_value_states,
-                        self.layer_idx,
-                        cache_kwargs,
-                    )
-            else:
-                key_states, value_states = past_key_values.update(
-                    key_states,
-                    value_states,
-                    self.layer_idx,
-                    cache_kwargs,
-                )
+        if past_key_values is not None and not self.is_kv_shared_layer:
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                cache_kwargs,
+            )
             if self.store_full_length_kv:
                 if not hasattr(past_key_values, "shared_layers"):
                     past_key_values.shared_layers = {}
-                if not hasattr(past_key_values, "shared_layers_token"):
-                    past_key_values.shared_layers_token = {}
                 past_key_values.shared_layers[self.layer_idx] = key_states, value_states
-                if token_key_states is not None and token_value_states is not None:
-                    past_key_values.shared_layers_token[self.layer_idx] = token_key_states, token_value_states
 
         if (
-            mm_token_type_ids is not None
+            use_mm_bidirectional_mask
+            and mm_token_type_ids is not None
             and hidden_states.shape[1] != 1
             and getattr(self.config, "use_bidirectional_attention", None) == "vision"
+            and self.sliding_window is not None
         ):
             attention_mask = _build_bidirectional_vision_attention_mask(
                 position_ids=position_ids,
@@ -480,6 +530,15 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
                 target_length=key_states.shape[-2],
                 dtype=query_states.dtype,
                 sliding_window=self.sliding_window,
+            )
+
+        if attention_mask is not None and attention_mask.shape[-1] != key_states.shape[-2]:
+            attention_mask = _build_additive_attention_mask(
+                position_ids=position_ids,
+                target_length=int(key_states.shape[-2]),
+                dtype=query_states.dtype,
+                sliding_window=self.sliding_window if self.is_sliding else None,
+                start_index=0,
             )
 
         attn_output, attn_weights = eager_attention_forward(
@@ -511,6 +570,7 @@ class QEffGemma4TextDecoderLayer(Gemma4TextDecoderLayer):
         position_embeddings: torch.Tensor = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         past_key_values: Cache | None = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -523,6 +583,7 @@ class QEffGemma4TextDecoderLayer(Gemma4TextDecoderLayer):
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            comp_ctx_lengths=comp_ctx_lengths,
             past_key_values=past_key_values,
             **kwargs,
         )
@@ -569,6 +630,7 @@ class QEffGemma4TextModel(Gemma4TextModel):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         per_layer_inputs: Optional[torch.Tensor] = None,
+        comp_ctx_lengths: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
@@ -581,23 +643,36 @@ class QEffGemma4TextModel(Gemma4TextModel):
 
         if input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids)
-
+        return_legacy_cache = False
         if self.hidden_size_per_layer_input:
             if per_layer_inputs is None:
                 per_layer_inputs = self.get_per_layer_inputs(input_ids, inputs_embeds)
             per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
-
-        if use_cache and isinstance(past_key_values, Cache) and not isinstance(past_key_values, QEffGemma4DynamicCache):
-            past_key_values = QEffGemma4DynamicCache.from_cache(self.config, past_key_values)
-        elif use_cache and not isinstance(past_key_values, Cache):
-            past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.config, past_key_values)
-        elif use_cache and past_key_values is None:
-            past_key_values = QEffGemma4DynamicCache(config=self.config)
+        if use_cache:
+            if past_key_values is None:
+                return_legacy_cache = True
+                past_key_values = QEffGemma4DynamicCache(config=self.config)
+            elif isinstance(past_key_values, QEffGemma4DynamicCache):
+                pass
+            elif isinstance(past_key_values, Cache):
+                past_key_values = QEffGemma4DynamicCache.from_cache(self.config, past_key_values)
+            else:
+                return_legacy_cache = True
+                past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.config, past_key_values)
 
         if position_ids is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
+
+        is_first_iteration = kwargs.get("is_first_iteration")
+        if is_first_iteration is None:
+            cache_initialized = (
+                bool(getattr(past_key_values, "is_initialized", False)) if past_key_values is not None else False
+            )
+            is_first_iteration = (
+                past_key_values is None or not cache_initialized or kwargs.get("pixel_values") is not None
+            )
 
         hidden_states = inputs_embeds
 
@@ -613,6 +688,8 @@ class QEffGemma4TextModel(Gemma4TextModel):
                 kwargs.get("mm_token_type_ids") is not None
                 and inputs_embeds.shape[1] != 1
                 and getattr(self.config, "use_bidirectional_attention", None) == "vision"
+                and layer_type == "sliding_attention"
+                and is_first_iteration
             )
             if isinstance(attention_mask, dict):
                 layer_attention_mask = attention_mask[layer_type]
@@ -620,35 +697,54 @@ class QEffGemma4TextModel(Gemma4TextModel):
                 layer_attention_mask = None
             else:
                 sliding_window = self.config.sliding_window if layer_type == "sliding_attention" else None
-                target_length = (
-                    min(self.config.sliding_window, self.config.max_position_embeddings)
-                    if sliding_window
-                    else inputs_embeds.shape[1]
-                )
-                if past_key_values is not None and len(past_key_values.layers) > i:
-                    layer_keys = past_key_values.layers[i].keys
-                    if layer_keys is not None and layer_keys.numel() > 0:
-                        target_length = layer_keys.shape[-2]
+                query_length = int(inputs_embeds.shape[1])
+                target_length = query_length
+                start_index = 0
+                if past_key_values is not None:
+                    try:
+                        target_length, start_index = past_key_values.get_mask_sizes(query_length, i)
+                    except TypeError:
+                        try:
+                            target_length, start_index = past_key_values.get_mask_sizes(
+                                query_length=query_length, layer_idx=i
+                            )
+                        except Exception:
+                            target_length, start_index = query_length, 0
+
+                    if getattr(decoder_layer.self_attn, "is_kv_shared_layer", False) and hasattr(
+                        past_key_values, "shared_layers"
+                    ):
+                        shared_idx = decoder_layer.self_attn.kv_shared_layer_index
+                        shared_states = past_key_values.shared_layers.get(shared_idx)
+                        if shared_states is not None and shared_states[0] is not None:
+                            target_length = int(shared_states[0].shape[-2])
+                            start_index = 0
+
                 layer_attention_mask = _build_additive_attention_mask(
                     position_ids=position_ids,
                     target_length=target_length,
                     dtype=hidden_states.dtype,
                     sliding_window=sliding_window,
+                    start_index=start_index,
                 )
 
+            layer_kwargs = dict(kwargs)
+            layer_kwargs["use_mm_bidirectional_mask"] = use_mm_bidirectional_mask
             hidden_states = decoder_layer(
                 hidden_states,
                 per_layer_input,
                 position_embeddings=position_embeddings[layer_type],
                 attention_mask=layer_attention_mask,
+                comp_ctx_lengths=comp_ctx_lengths,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                **kwargs,
+                **layer_kwargs,
             )
 
         hidden_states = self.norm(hidden_states)
-        next_cache = past_key_values.to_legacy_cache() if use_cache else None
-        output = BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=next_cache)
+        if return_legacy_cache and hasattr(past_key_values, "to_legacy_cache"):
+            past_key_values = past_key_values.to_legacy_cache()
+        output = BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values)
         return output if return_dict else output.to_tuple()
 
 
@@ -1002,7 +1098,11 @@ class QEffGemma4DecoderWrapper(nn.Module):
         **kwargs,
     ):
         del kwargs
-        if past_key_values is not None and not isinstance(past_key_values, Cache):
+        if (
+            past_key_values is not None
+            and not isinstance(past_key_values, Cache)
+            and not torch.onnx.is_in_onnx_export()
+        ):
             past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.language_model.config, past_key_values)
 
         # Prefer multimodal token type ids when available; this is the most reliable
@@ -1129,7 +1229,7 @@ class QEffGemma4EncoderWrapper(nn.Module):
             vision_embeds = vision_embeds.unsqueeze(0)
 
         # Keep the encoder output fixed-shape for dual-QPC export/compile.
-        # Gemma4 uses vision_config.default_output_length/image_seq_length
+        # Gemma4 E2B uses vision_config.default_output_length/image_seq_length
         # image placeholders (280), while the vision pooler may emit extra
         # padded bins for the max-patch canvas.
         del pooler_mask
@@ -1197,6 +1297,13 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
         ctx_len = ctx_len if ctx_len else constants.INTERN_CTX_LEN
         max_patches = self._get_vision_max_patches()
         user_vision_size = compiler_options.pop("vision_size", None)
+        config_sliding_window = self.model.language_model.config.sliding_window
+        effective_sliding_window = (
+            min(config_sliding_window, ctx_len) if config_sliding_window is not None else config_sliding_window
+        )
+        # Keep model config aligned with compile-time specialization so dummy-cache
+        # export shapes (built later) do not drift from specialization symbols.
+        self.model.language_model.config.sliding_window = effective_sliding_window
         if user_vision_size:
             if user_vision_size >= ctx_len:
                 raise ValueError("vision_size must be less than ctx_len")
@@ -1211,7 +1318,7 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
                 "batch_size": 1 if continuous_batching else batch_size,
                 "seq_len": prefill_seq_len,
                 "ctx_len": ctx_len,
-                "sliding_window": self.model.language_model.config.sliding_window,
+                "sliding_window": effective_sliding_window,
                 "vision_batch_size": batch_size,
                 "vision_size": vision_size,
             }
@@ -1230,7 +1337,7 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
                 "batch_size": full_batch_size if continuous_batching else batch_size,
                 "seq_len": "1",
                 "ctx_len": ctx_len,
-                "sliding_window": self.model.language_model.config.sliding_window,
+                "sliding_window": effective_sliding_window,
                 "vision_batch_size": batch_size,
                 "vision_size": vision_size,
             }
@@ -1318,13 +1425,27 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
         return past_key_values
 
     def get_dummy_inputs(
-        self, comp_ctx_lengths: Optional[List[int]] = None, kv_offload: bool = False, continuous_batching: bool = False
+        self,
+        comp_ctx_lengths: Optional[List[int]] = None,
+        kv_offload: bool = False,
+        continuous_batching: bool = False,
+        prefill_seq_len: Optional[int] = None,
+        ctx_len: Optional[int] = None,
     ):
         bs = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         fbs = constants.ONNX_EXPORT_EXAMPLE_FBS
         max_patches = self._get_vision_max_patches()
         mm_tokens_per_image = self._get_mm_tokens_per_image()
         seq_len = max(constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN, mm_tokens_per_image + 32)
+        if prefill_seq_len is not None:
+            seq_len = max(seq_len, int(prefill_seq_len))
+        if ctx_len is None:
+            configured_ctx_len = getattr(self.model.language_model.config, "sliding_window", None)
+            if configured_ctx_len is None:
+                configured_ctx_len = getattr(self.model.language_model.config, "max_position_embeddings", None)
+        else:
+            configured_ctx_len = int(ctx_len)
+        cache_seq_len = max(seq_len, int(configured_ctx_len)) if configured_ctx_len is not None else seq_len
         patch_dim = getattr(self.config.vision_config, "patch_size", 16) ** 2 * 3
 
         image_position_ids = torch.full((bs, max_patches, 2), -1, dtype=torch.int64)
@@ -1356,7 +1477,7 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
             "past_key_values": self.get_dummy_pkv_cache(
                 config=self.model.language_model.config,
                 batch_size=fbs if continuous_batching else bs,
-                seq_len=seq_len,
+                seq_len=cache_seq_len,
             ),
         }
         if continuous_batching:

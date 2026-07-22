@@ -289,6 +289,41 @@ class InputHandlerVLM:
         self.conversation = conversation
         self.dtype = dtype
 
+    def _get_text_config(self):
+        if hasattr(self.config, "text_config"):
+            return self.config.text_config
+        if hasattr(self.config, "llm_config"):
+            return self.config.llm_config
+        return self.config
+
+    def _num_layers(self):
+        if isinstance(self.n_layer, int):
+            return self.n_layer
+        if isinstance(self.n_layer, (list, tuple)):
+            return int(self.n_layer[0])
+        return int(self.n_layer)
+
+    def _get_layer_cache_shape(self, txt_cfg, layer_idx):
+        head_dim = getattr(txt_cfg, "head_dim", txt_cfg.hidden_size // txt_cfg.num_attention_heads)
+        if hasattr(txt_cfg, "layer_types") and txt_cfg.layer_types is not None:
+            layer_type = txt_cfg.layer_types[layer_idx]
+            if layer_type == "sliding_attention":
+                n_heads = txt_cfg.num_key_value_heads
+                d_head = head_dim
+                ctx_len = min(getattr(txt_cfg, "sliding_window", self.ctx_len), self.ctx_len)
+            else:
+                use_alternative_attention = getattr(txt_cfg, "attention_k_eq_v", False)
+                n_heads = (
+                    txt_cfg.num_global_key_value_heads
+                    if use_alternative_attention and getattr(txt_cfg, "num_global_key_value_heads", None) is not None
+                    else txt_cfg.num_key_value_heads
+                )
+                d_head = txt_cfg.global_head_dim if getattr(txt_cfg, "global_head_dim", None) else head_dim
+                ctx_len = self.ctx_len
+            return (self.batch_size, n_heads, ctx_len, d_head)
+
+        return (self.batch_size, txt_cfg.num_key_value_heads, self.ctx_len, head_dim)
+
     def prepare_pytorch_inputs(self):
         """
         Function responsible for creating Prefill stage tensor inputs for PyTorch model.
@@ -297,12 +332,8 @@ class InputHandlerVLM:
             :Dict: input_ids, position_ids, past_key_values
         """
         inputs = self.processor(images=self.image, text=self.prompt, return_tensors="pt")
-        if hasattr(self.config, "text_config"):
-            txt_cfg = self.config.text_config
-        else:
-            txt_cfg = self.config.llm_config
-
-        num_hidden_layers = txt_cfg.num_hidden_layers
+        txt_cfg = self._get_text_config()
+        num_hidden_layers = self._num_layers()
         num_key_value_heads = txt_cfg.num_key_value_heads
         head_dim = getattr(txt_cfg, "head_dim", txt_cfg.hidden_size // txt_cfg.num_attention_heads)
         if hasattr(txt_cfg, "cross_attention_layers"):
@@ -326,21 +357,19 @@ class InputHandlerVLM:
                     )
                 )
             else:
+                pad_shape = self._get_layer_cache_shape(txt_cfg, i)
                 inputs["past_key_values"].append(
                     (
-                        torch.zeros((1, num_key_value_heads, self.ctx_len, head_dim), dtype=self.dtype),
-                        torch.zeros((1, num_key_value_heads, self.ctx_len, head_dim), dtype=self.dtype),
+                        torch.zeros(pad_shape, dtype=self.dtype),
+                        torch.zeros(pad_shape, dtype=self.dtype),
                     )
                 )
 
         return inputs
 
     def prepare_vlm_ort_inputs(self):
-        if hasattr(self.config, "text_config"):
-            txt_cfg = self.config.text_config
-        else:
-            txt_cfg = self.config.llm_config
-        num_hidden_layers = txt_cfg.num_hidden_layers
+        txt_cfg = self._get_text_config()
+        num_hidden_layers = self._num_layers()
         num_key_value_heads = txt_cfg.num_key_value_heads
         head_dim = getattr(txt_cfg, "head_dim", txt_cfg.hidden_size // txt_cfg.num_attention_heads)
         if hasattr(txt_cfg, "cross_attention_layers"):
@@ -372,12 +401,9 @@ class InputHandlerVLM:
                     (self.batch_size, num_key_value_heads, image_tokens_len, head_dim), dtype=np.float32
                 )
             else:
-                inputs["past_key." + str(i)] = np.zeros(
-                    (self.batch_size, num_key_value_heads, self.ctx_len, head_dim), dtype=np.float32
-                )
-                inputs["past_value." + str(i)] = np.zeros(
-                    (self.batch_size, num_key_value_heads, self.ctx_len, head_dim), dtype=np.float32
-                )
+                pad_shape = self._get_layer_cache_shape(txt_cfg, i)
+                inputs["past_key." + str(i)] = np.zeros(pad_shape, dtype=np.float32)
+                inputs["past_value." + str(i)] = np.zeros(pad_shape, dtype=np.float32)
         lang_inputs = {k: v for k, v in inputs.items() if k not in vision_inputs}
         return vision_inputs, lang_inputs
 
@@ -392,7 +418,7 @@ class InputHandlerVLM:
             updated_outputs (Dict): Updated past_key_values, logits, pixel_values
         """
         present_key_values = []
-        for i in range(self.n_layer[0]):
+        for i in range(self._num_layers()):
             if "past_key." + str(i) + "_RetainedState" in ort_outputs:
                 present_key_values.append(ort_outputs["past_key." + str(i) + "_RetainedState"])
             if "past_value." + str(i) + "_RetainedState" in ort_outputs:
@@ -427,7 +453,7 @@ class InputHandlerVLM:
         updated_inputs = {}
         updated_inputs["input_ids"] = ort_outputs["logits"].argmax(-1)
         updated_inputs["position_ids"] = np.max(inputs["position_ids"], axis=1, keepdims=True) + 1
-        for i in range(self.n_layer[0]):
+        for i in range(self._num_layers()):
             updated_inputs["past_key." + str(i)] = ort_outputs["past_key_values"][i * 2]
             updated_inputs["past_value." + str(i)] = ort_outputs["past_key_values"][i * 2 + 1]
         if "pixel_values_RetainedState" in ort_outputs.keys():
