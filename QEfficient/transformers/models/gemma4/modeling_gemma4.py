@@ -56,6 +56,15 @@ _FP16_CLAMP_MAX = 65504.0
 _DISABLE_EXPORT_FP16_CLAMP = False
 
 
+def _resolve_cache_dtype(config) -> torch.dtype:
+    dtype = getattr(config, "torch_dtype", None)
+    if dtype is None:
+        dtype = getattr(config, "dtype", None)
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype, None)
+    return dtype if isinstance(dtype, torch.dtype) else torch.float32
+
+
 def _is_onnx_export() -> bool:
     return torch.onnx.is_in_onnx_export()
 
@@ -251,10 +260,11 @@ class QEffGemma4TextRouter(Gemma4TextRouter):
             self.norm.register_buffer("_qeff_unit_weight", torch.ones(self.hidden_size))
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states).to(hidden_states.dtype)
         hidden_states = hidden_states * self.scale * self.scalar_root_size
-
-        router_probabilities = nn.functional.softmax(self.proj(hidden_states), dim=-1)
+        router_probabilities = nn.functional.softmax(self.proj(hidden_states), dim=-1, dtype=torch.float32).to(
+            hidden_states.dtype
+        )
         top_k_weights, top_k_index = torch.topk(
             router_probabilities,
             k=self.config.top_k_experts,
@@ -524,8 +534,7 @@ class QEffGemma4TextAttention(Gemma4TextAttention):
             key_states = key_states.transpose(1, 2)
             if key_states.dtype != target_dtype:
                 key_states = key_states.to(target_dtype)
-
-            value_states = self.v_norm(value_states)
+            value_states = self.v_norm(value_states).to(key_states.dtype)
             value_states = value_states.transpose(1, 2)
             if value_states.dtype != target_dtype:
                 value_states = value_states.to(target_dtype)
@@ -724,8 +733,8 @@ class QEffGemma4TextModel(Gemma4TextModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids)
-
+            inputs_embeds = self.embed_tokens(input_ids.to(self.config.dtype))
+        inputs_embeds = inputs_embeds.to(self.config.dtype)
         target_dtype = self.embed_tokens.weight.dtype
         if inputs_embeds is not None and inputs_embeds.dtype != target_dtype:
             inputs_embeds = inputs_embeds.to(target_dtype)
@@ -1081,6 +1090,7 @@ class QEffGemma4ForCausalLM(Gemma4ForCausalLM):
         return {QEffGemma4TextDecoderLayer}
 
     def get_dummy_pkv_cache(self, config, batch_size, seq_len):
+        cache_dtype = _resolve_cache_dtype(config)
         past_key_values = []
         for layer_type in config.layer_types:
             if layer_type == "sliding_attention":
@@ -1484,6 +1494,7 @@ class QEffGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
         return lang_output_names
 
     def get_dummy_pkv_cache(self, config, batch_size, seq_len):
+        cache_dtype = _resolve_cache_dtype(config)
         past_key_values = []
         for i, layer_type in enumerate(config.layer_types):
             if layer_type == "sliding_attention":
