@@ -1024,7 +1024,7 @@
       "num_layers": 2,
       "additional_params": {}
     },
-        {
+    {
       "model_name": "tiny-random/gemma-4-dense",
       "model_type": "gemma4",
       "supports_blocking": false,
